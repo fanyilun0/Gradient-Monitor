@@ -36,6 +36,10 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
         
         print(f"\n=== 检查Token: {token_config['name']} ===")
         
+        # 初始化变量
+        profile_data = None
+        current_state = None
+        
         # 获取节点数据
         current_state = await fetch_nodes_data(
             session=session,
@@ -43,21 +47,29 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
             api_token=token_config['token']
         )
         
+        if not current_state:
+            print(f"获取节点数据失败，跳过此token: {token_config['name']}")
+            return
+            
         # 获取个人资料数据
-        profile_data = await fetch_profile_data(
-            session=session,
-            api_token=token_config['token']
-        )
-        
+        try:
+            profile_data = await fetch_profile_data(
+                session=session,
+                api_token=token_config['token']
+            )
+        except Exception as e:
+            print(f"获取个人资料失败: {str(e)}")
+            return
+            
         if current_state and profile_data:
             # 检查在线节点数
             online_nodes = sum(1 for node in current_state if node['connect'])
-            expected_online = profile_data.get('node', {}).get('sentryActive', 0)  # 使用 sentryActive 作为预期在线数
+            expected_online = profile_data.get('node', {}).get('sentryActive', 0)
             
             # 判断是否需要推送消息
             should_notify = (
-                ALWAYS_NOTIFY or  # 总是推送
-                online_nodes < expected_online  # 在线节点数小于预期
+                ALWAYS_NOTIFY or
+                online_nodes < expected_online
             )
             
             if should_notify:
@@ -75,7 +87,6 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
             
     except Exception as e:
         print(f"监控Token {token_config['name']} 时出错: {str(e)}")
-        print("Profile数据:", json.dumps(profile_data, indent=2))
 
 def get_random_user_agent():
     """获取随机User-Agent"""
@@ -111,20 +122,19 @@ async def fetch_nodes_data(session, api_url, api_token):
     """获取节点数据"""
     headers = {
         "accept": "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+        "accept-encoding": "gzip, deflate, br",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "authorization": f"Bearer {api_token}",
         "content-type": "application/json",
+        "user-agent": get_random_user_agent(),
         "origin": "https://app.gradient.network",
         "referer": "https://app.gradient.network/",
-        "sec-ch-ua": '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"macOS"',
+        "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "cache-control": "no-cache",
-        "pragma": "no-cache"
+        "sec-fetch-site": "same-site"
     }
     
     payload = {
@@ -137,21 +147,48 @@ async def fetch_nodes_data(session, api_url, api_token):
         "size": 12
     }
 
+    print(f"\n--- 请求详情 ---")
+    print(f"API URL: {api_url}")
+    print(f"Headers: {json.dumps(headers, indent=2)}")
+    print(f"Payload: {json.dumps(payload, indent=2)}")
+
     try:
-        async with session.post(api_url, headers=headers, json=payload) as response:
-            if response.status == 200:
+        async with session.post(api_url, headers=headers, json=payload, timeout=30, ssl=False) as response:
+            print(f"\n--- 响应详情 ---")
+            print(f"状态码: {response.status}")
+            
+            response_text = await response.text()
+            print(f"响应内容: {response_text[:500]}...")  # 只打印前500个字符
+            
+            if response.status == 403:
+                print(f"Token认证失败，请检查token是否有效: {api_token}")
+                return None
+            elif response.status == 200:
                 data = await response.json()
-                if data.get('code') == 200:
-                    return data.get('data', [])
-                else:
-                    raise Exception(f"API返回错误: {data}")
-            else:
-                error_text = await response.text()
-                raise Exception(f"API请求失败: {response.status}, 错误信息: {error_text}")
+                print(f"\n--- 解析结果 ---")
+                print(f"响应代码: {data.get('code')}")
+                print(f"响应消息: {data.get('message', '无')}")
                 
+                if data.get('code') == 200:
+                    result_data = data.get('data', [])
+                    print(f"获取到的节点数量: {len(result_data)}")
+                    return result_data
+                else:
+                    print(f"API返回错误码: {data.get('code')}, 消息: {data.get('message', '未知错误')}")
+                    return None
+            else:
+                print(f"API请求失败: {response.status}, 错误信息: {response_text}")
+                return None
+                
+    except asyncio.TimeoutError:
+        print("请求超时")
+        return None
     except Exception as e:
         print(f"获取数据失败: {str(e)}")
-        raise
+        print(f"异常类型: {type(e).__name__}")
+        import traceback
+        print(f"详细错误信息: {traceback.format_exc()}")
+        return None
 
 async def fetch_profile_data(session, api_token):
     """获取用户资料数据"""
@@ -235,28 +272,38 @@ async def monitor_nodes(interval, webhook_url, use_proxy, proxy_url, always_noti
     """监控节点状态"""
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                # 为每个token创建监控任务
-                tasks = []
-                for token_config in TOKENS_CONFIG:
-                    task = monitor_single_token(
-                        session=session,
-                        token_config=token_config,
-                        webhook_url=webhook_url,
-                        use_proxy=use_proxy,
-                        proxy_url=proxy_url
-                    )
-                    tasks.append(task)
-                
-                # 并发执行所有token的监控任务
-                await asyncio.gather(*tasks)
-                
+            # 为每个token创建独立的监控任务，每个任务使用独立的session
+            tasks = []
+            for token_config in TOKENS_CONFIG:
+                task = monitor_token_with_session(
+                    token_config=token_config,
+                    webhook_url=webhook_url,
+                    use_proxy=use_proxy,
+                    proxy_url=proxy_url
+                )
+                tasks.append(task)
+            
+            # 并发执行所有token的监控任务
+            await asyncio.gather(*tasks)
+            
         except Exception as e:
             print(f"监控过程出错: {str(e)}")
             await asyncio.sleep(5)
             continue
             
         await asyncio.sleep(interval)
+
+async def monitor_token_with_session(token_config, webhook_url, use_proxy, proxy_url):
+    """为每个token创建独立的session进行监控"""
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        await monitor_single_token(
+            session=session,
+            token_config=token_config,
+            webhook_url=webhook_url,
+            use_proxy=use_proxy,
+            proxy_url=proxy_url
+        )
 
 def format_point(point_value):
     """将积分格式化为 x,xxx.x pt 格式"""
