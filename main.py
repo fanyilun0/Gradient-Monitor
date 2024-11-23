@@ -9,22 +9,23 @@ import zstandard as zstd  # 需要先安装：pip install zstandard
 previous_state = {}
 
 # 导入配置
-from mconfig import (
-    API_URL,  # 所有token共用的API地址
-    TOKENS_CONFIG,  # 只包含token相关配置
+from config import (
+    API_URL,  # 节点列表API
+    PROFILE_API_URL,  # 个人资料API
+    TOKENS_CONFIG,
     WEBHOOK_URL, 
     PROXY_URL, 
     USE_PROXY, 
     INTERVAL, 
     TIME_OFFSET,
     ALWAYS_NOTIFY,
-    SHOW_DETAIL  # 新增这一行
+    SHOW_DETAIL
 )
 
 # 新增：随机延迟函数
 async def random_delay():
     """生成随机延迟时间（3-10秒）"""
-    delay = random.uniform(30, 100)
+    delay = random.uniform(3, 10)
     print(f"等待 {delay:.2f} 秒...")
     await asyncio.sleep(delay)
 
@@ -33,33 +34,48 @@ async def monitor_single_token(session, token_config, webhook_url, use_proxy, pr
     try:
         await random_delay()
         
+        print(f"\n=== 检查Token: {token_config['name']} ===")
+        
+        # 获取节点数据
         current_state = await fetch_nodes_data(
             session=session,
             api_url=API_URL,
             api_token=token_config['token']
         )
         
-        if current_state:
-            print(f"\n=== 检查Token: {token_config['name']} ===")
-            previous = token_config.get('previous_state', {})
+        # 获取个人资料数据
+        profile_data = await fetch_profile_data(
+            session=session,
+            api_token=token_config['token']
+        )
+        
+        if current_state and profile_data:
+            # 检查在线节点数
+            online_nodes = sum(1 for node in current_state if node['connect'])
+            expected_online = profile_data.get('node', {}).get('sentryActive', 0)  # 使用 sentryActive 作为预期在线数
             
-            # 检查是否有离线节点
-            offline_nodes = [node for node in current_state if not node['isConnected']]
+            # 判断是否需要推送消息
+            should_notify = (
+                ALWAYS_NOTIFY or  # 总是推送
+                online_nodes < expected_online  # 在线节点数小于预期
+            )
             
-            # 构建消息并发送
-            if offline_nodes:  # 有离线节点时发送离线警告
-                message = build_offline_status_message(current_state, offline_nodes)
-            else:  # 所有节点在线时发送正常状态报告
-                message = build_status_message(current_state, SHOW_DETAIL)
-                
-            if message:
-                message = f"【{token_config['name']}】\n{message}"
-                await send_message_async(webhook_url, message, use_proxy, proxy_url)
+            if should_notify:
+                message = build_status_message(
+                    current_state, 
+                    profile_data, 
+                    SHOW_DETAIL,
+                    online_nodes,
+                    expected_online
+                )
+                if message:
+                    await send_message_async(webhook_url, message, use_proxy, proxy_url)
             
             token_config['previous_state'] = copy.deepcopy(current_state)
             
     except Exception as e:
         print(f"监控Token {token_config['name']} 时出错: {str(e)}")
+        print("Profile数据:", json.dumps(profile_data, indent=2))
 
 def get_random_user_agent():
     """获取随机User-Agent"""
@@ -94,78 +110,74 @@ async def send_message_async(webhook_url, message_content, use_proxy, proxy_url)
 async def fetch_nodes_data(session, api_url, api_token):
     """获取节点数据"""
     headers = {
-        "authority": "gateway-run.bls.dev",
-        "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "authorization": f"Bearer {api_token}",  # 使用传入的api_token
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+        "authorization": f"Bearer {api_token}",
         "content-type": "application/json",
-        "origin": "https://bless.network",
-        "referer": "https://bless.network/",
-        "user-agent": get_random_user_agent()
+        "origin": "https://app.gradient.network",
+        "referer": "https://app.gradient.network/",
+        "sec-ch-ua": '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "cache-control": "no-cache",
+        "pragma": "no-cache"
+    }
+    
+    payload = {
+        "active": True,
+        "banned": False,
+        "direction": 0,
+        "field": "active",
+        "hide": 0,
+        "page": 1,
+        "size": 12
     }
 
     try:
-        async with session.get(api_url, headers=headers) as response: 
-            print(f"响应状态码: {response.status}")
-            print(f"Content-Type: {response.headers.get('content-type')}")
-            print(f"Server: {response.headers.get('server')}")
-            
+        async with session.post(api_url, headers=headers, json=payload) as response:
             if response.status == 200:
-                # 获取原始压缩数据
-                compressed_data = await response.read()
-                print(f"Content-Encoding: {response.headers.get('content-encoding')}")
-                
-                try:
-                    # 使用 zstd 解压数据，使用流式解压
-                    dctx = zstd.ZstdDecompressor()
-                    # 创建一个输入缓冲区
-                    with dctx.stream_reader(compressed_data) as reader:
-                        decompressed_data = reader.read()
-                    
-                    # 解析 JSON
-                    data = json.loads(decompressed_data)
-                    print(f"成功获取数据，节点数量: {len(data) if isinstance(data, list) else 'N/A'}")
-                    
-                    # 在成功获取数据后添加统计信息
-                    if isinstance(data, list):
-                        total_reward = sum(node['totalReward'] for node in data)
-                        total_today_reward = sum(node['todayReward'] for node in data)
-                        online_nodes = sum(1 for node in data if node['isConnected'])
-                        
-                        print("\n=== 节点统计信息 ===")
-                        print(f"总节点数量: {len(data)}")
-                        print(f"在线节点数量: {online_nodes}")
-                        print(f"总奖励: {total_reward}")
-                        print(f"今日总奖励: {total_today_reward}")
-                        print("\n=== 各节点详情 ===")
-                        for node in data:
-                            print(f"\n节点 {node['pubKey'][:20]}...")
-                            print(f"  状态: {'在线' if node['isConnected'] else '离线'}")
-                            print(f"  总奖励: {node['totalReward']}")
-                            print(f"  今日奖励: {node['todayReward']}")
-                            print(f"  Sessions数量: {len(node['sessions'])}")
-                    
-                    return data
-                    
-                except zstd.ZstdError as e:
-                    print(f"ZSTD解压错误: {str(e)}")
-                    print(f"压缩数据大小: {len(compressed_data)} 字节")
-                    raise
-                except json.JSONDecodeError as e:
-                    print(f"JSON解析错误: {str(e)}")
-                    print(f"解压后的数据前200字节: {decompressed_data[:200]}")
-                    raise
+                data = await response.json()
+                if data.get('code') == 200:
+                    return data.get('data', [])
+                else:
+                    raise Exception(f"API返回错误: {data}")
             else:
-                response_text = await response.text()
-                print(f"错误响应: {response_text}")
-                raise Exception(f"API请求失败: {response.status}")
+                error_text = await response.text()
+                raise Exception(f"API请求失败: {response.status}, 错误信息: {error_text}")
                 
-    except aiohttp.ClientError as e:
-        print(f"网络请求错误: {str(e)}")
-        raise
     except Exception as e:
-        print(f"其他异常: {str(e)}")
+        print(f"获取数据失败: {str(e)}")
+        raise
+
+async def fetch_profile_data(session, api_token):
+    """获取用户资料数据"""
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7",
+        "authorization": f"Bearer {api_token}",
+        "content-type": "application/json",
+        "origin": "https://app.gradient.network",
+        "referer": "https://app.gradient.network/",
+        "user-agent": get_random_user_agent()
+    }
+    
+    try:
+        async with session.post(PROFILE_API_URL, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('code') == 200:
+                    return data.get('data', {})  # 返回 data 字段的内容
+                else:
+                    raise Exception(f"API返回错误: {data}")
+            else:
+                error_text = await response.text()
+                raise Exception(f"获取个人资料失败: {response.status}, 错误信息: {error_text}")
+    except Exception as e:
+        print(f"获取个人资料失败: {str(e)}")
         raise
 
 def compare_states(previous, current):
@@ -246,70 +258,52 @@ async def monitor_nodes(interval, webhook_url, use_proxy, proxy_url, always_noti
             
         await asyncio.sleep(interval)
 
-def build_offline_status_message(current_state, offline_nodes):
-    """构建离线节点状态消息"""
-    adjusted_time = datetime.now() + timedelta(hours=TIME_OFFSET)
-    timestamp = adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
-    
-    total_nodes = len(current_state)
-    online_nodes = total_nodes - len(offline_nodes)
-    total_reward = sum(node['totalReward'] for node in current_state)
-    total_today_reward = sum(node['todayReward'] for node in current_state)
-    
-    message_lines = [
-        "⚠️ 【节点离线警告】⚠️",
-        f"时间: {timestamp}\n",
-        f"📊 节点统计:",
-        f"  • 节点总数: {total_nodes}",
-        f"  • 在线节点: {online_nodes}",
-        f"  • 离线节点: {len(offline_nodes)}",
-        f"\n💰 奖励统计:",
-        f"  • 总奖励: {total_reward}",
-        f"  • 今日奖励: {total_today_reward}",
-        f"\n❌ 离线节点详情:"
-    ]
-    
-    for node in offline_nodes:
-        # 获取pubKey的最后6位
-        pub_key_short = node['pubKey'][-6:]
-        message_lines.extend([
-            f"  • 节点: ...{pub_key_short}",
-            f"    奖励: {node['totalReward']} / 今日: {node['todayReward']}"
-        ])
-    
-    return "\n".join(message_lines)
+def format_point(point_value):
+    """将积分格式化为 x,xxx.x pt 格式"""
+    point = float(point_value) / 100000  # 转换为pt单位
+    return f"{point:,.1f} pt"
 
-def build_status_message(current_state, show_detail=False):  # 修改函数签名
+def build_status_message(current_state, profile_data, show_detail, online_nodes, expected_online):
     """构建状态消息"""
     adjusted_time = datetime.now() + timedelta(hours=TIME_OFFSET)
     timestamp = adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
     
-    total_reward = sum(node['totalReward'] for node in current_state)
-    total_today_reward = sum(node['todayReward'] for node in current_state)
-    online_nodes = sum(1 for node in current_state if node['isConnected'])
+    total_today = sum(node['today'] for node in current_state)
+    
+    # 获取积分信息
+    point_data = profile_data.get('point', {})
+    total_point = format_point(point_data.get('total', 0))
+    balance_point = format_point(point_data.get('balance', 0))
+    referral_point = format_point(point_data.get('referral', 0))
+    
+    # 获取节点信息
+    node_data = profile_data.get('node', {})
+    
+    # 添加节点状态警告
+    status_emoji = "✅" if online_nodes >= expected_online else "⚠️"
     
     message_lines = [
-        "📊 【节点状态报告】",
+        f"{status_emoji} 【Gradient状态报告】",
         f"时间: {timestamp}\n",
-        f"📈 节点统计:",
-        f"  • 节点总数: {len(current_state)}",
+        f"💎 积分统计:",
+        f"  • 账号: {profile_data.get('name')}",
+        f"  • 总积分: {total_point}",
+        f"  • 可用积分: {balance_point}",
+        f"  • 推荐奖励: {referral_point}",
+        f"\n🖥️ 节点统计:",
+        f"  • 预期活跃: {expected_online}",
         f"  • 在线节点: {online_nodes}",
-        f"\n💰 奖励统计:",
-        f"  • 总奖励: {total_reward}",
-        f"  • 今日奖励: {total_today_reward}"
+        f"  • 今日积分: {format_point(total_today)}"
     ]
     
-    # 只在show_detail为True时添加节点详情
     if show_detail:
-        message_lines.extend([
-            f"\n📝 节点详情:"
-        ])
+        message_lines.extend(["\n📝 节点详情:"])
         for node in current_state:
-            status_emoji = "✅" if node['isConnected'] else "❌"
-            pub_key_short = node['pubKey'][-6:]
+            status_emoji = "✅" if node['connect'] else "❌"
             message_lines.extend([
-                f"  • 节点: ...{pub_key_short} {status_emoji}",
-                f"    奖励: {node['totalReward']} / 今日: {node['todayReward']}"
+                f"  • {node['name']} {status_emoji}",
+                f"    积分: {format_point(node['point'])} / 今日: {format_point(node['today'])}",
+                f"    延迟: {node['latency']}ms / 位置: {node['location']['country']}-{node['location']['place']}"
             ])
     
     return "\n".join(message_lines)
