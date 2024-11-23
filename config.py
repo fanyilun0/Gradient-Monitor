@@ -1,5 +1,6 @@
 # API配置
-API_URL = "https://gateway-run.bls.dev/api/v1/nodes"
+API_URL = "https://api.gradient.network/api/sentrynode/list"
+PROFILE_API_URL = "https://api.gradient.network/api/user/profile"
 
 # Token配置示例
 # TOKENS_CONFIG = [
@@ -21,7 +22,8 @@ WEBHOOK_URL = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='
 # 代理配置
 PROXY_URL = 'http://localhost:7890'
 USE_PROXY = False
-ALWAYS_SEND = True
+ALWAYS_NOTIFY = True
+SHOW_DETAIL = True
 # 时间配置
-INTERVAL = 300  # 5分钟检查一次
-TIME_OFFSET = 8  
+INTERVAL = 36000  # 10小时检查一次
+TIME_OFFSET = 6  
